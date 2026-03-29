@@ -5,396 +5,271 @@ from PIL import Image, ImageTk
 import threading
 import time
 import numpy as np
+import winsound
 
-from posture import (
-    load_predictor, get_landmarks, get_posture_state,
-    draw_landmarks_on_frame, DEFAULT_THRESHOLDS
-)
-from alert import AlertManager
+BG_DARK  = "#0d1117"
+BG_CARD  = "#161b22"
+GOOD_C   = "#38d9a9"
+WARN_C   = "#f59f00"
+BAD_C    = "#f76f6f"
+ACCENT   = "#4f8ef7"
+TEXT_PRI = "#e6edf3"
+TEXT_SEC = "#7d8590"
+BORDER   = "#30363d"
 
-# ── Theme ──
-BG_DARK   = "#0d1117"
-BG_CARD   = "#161b22"
-BG_PANEL  = "#0d1117"
-GOOD_C    = "#38d9a9"
-WARN_C    = "#f59f00"
-BAD_C     = "#f76f6f"
-ACCENT    = "#4f8ef7"
-TEXT_PRI  = "#e6edf3"
-TEXT_SEC  = "#7d8590"
-BORDER    = "#30363d"
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-FONT_HEAD = ("Segoe UI", 18, "bold")
-FONT_SUB  = ("Segoe UI", 10)
-FONT_MONO = ("Consolas", 10)
-FONT_SM   = ("Consolas", 9)
+
+def analyze_posture(fx, fy, fw, fh, frame_w, frame_h, baseline):
+    cx = fx + fw // 2
+    cy = fy + fh // 2
+    size_ratio = fw / frame_w
+    metrics = {
+        "face_y_pct":    round(cy / frame_h * 100, 1),
+        "face_size_pct": round(size_ratio * 100, 1),
+        "center_offset": round(abs(cx - frame_w // 2) / frame_w * 100, 1),
+    }
+    if baseline is None:
+        return "GOOD", metrics, {"y": cy, "size": size_ratio}
+
+    y_drop     = cy - baseline["y"]
+    size_change = size_ratio - baseline["size"]
+    x_offset   = abs(cx - frame_w // 2) / frame_w * 100
+
+    score = 0
+    if y_drop > frame_h * 0.04:   score += 2
+    elif y_drop > frame_h * 0.02: score += 1
+    if size_change > 0.6:         score += 1
+    if x_offset > 15:              score += 1
+
+    state = "SLOUCH" if score >= 2 else "WARNING" if score >= 1 else "GOOD"
+    return state, metrics, baseline
 
 
 class PostureApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PostureGuard — Real-Time Posture Monitor")
-        self.geometry("1150x720")
+        self.geometry("1100x700")
         self.configure(bg=BG_DARK)
         self.resizable(True, True)
 
-        # Load dlib predictor
-        try:
-            load_predictor()
-        except FileNotFoundError as e:
-            messagebox.showerror("Missing Model File", str(e))
-            self.destroy()
-            return
-
-        # State
-        self.cap        = None
-        self.running    = False
-        self.thresholds = dict(DEFAULT_THRESHOLDS)
-        self.alert_mgr  = AlertManager(
-            sound_enabled=True,
-            visual_enabled=True,
-            cooldown_seconds=8,
-            slouch_frames_threshold=20
-        )
-
-        # Stats
-        self.total_frames  = 0
-        self.good_frames   = 0
-        self.warn_frames   = 0
-        self.bad_frames    = 0
+        self.cap = None
+        self.running = False
+        self.baseline = None
+        self.alert_streak = 0
+        self.alert_count = 0
+        self.total_frames = 0
+        self.good_frames = 0
         self.session_start = None
+        self.last_alert = 0
+        self.warmup = 0
 
-        # Tkinter vars
-        self.status_var    = tk.StringVar(value="Ready. Click 'Start' to begin monitoring.")
-        self.posture_var   = tk.StringVar(value="—")
-        self.score_var     = tk.StringVar(value="—")
-        self.tilt_var      = tk.StringVar(value="—")
-        self.ear_var       = tk.StringVar(value="—")
-        self.eye_var       = tk.StringVar(value="—")
-        self.session_var   = tk.StringVar(value="00:00")
-        self.good_pct_var  = tk.StringVar(value="—")
-        self.alerts_var    = tk.StringVar(value="0")
+        self.status_var  = tk.StringVar(value="Ready. Click Start Monitoring.")
+        self.posture_var = tk.StringVar(value="—")
+        self.y_var       = tk.StringVar(value="—")
+        self.size_var    = tk.StringVar(value="—")
+        self.offset_var  = tk.StringVar(value="—")
+        self.good_var    = tk.StringVar(value="—")
+        self.alert_var   = tk.StringVar(value="0")
+        self.session_var = tk.StringVar(value="00:00")
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._tick_clock()
+        self._tick()
 
-    # ─────────────────────────────────────────────
-    # UI
-    # ─────────────────────────────────────────────
     def _build_ui(self):
-        # Header
         hdr = tk.Frame(self, bg=BG_DARK)
         hdr.pack(fill="x", padx=20, pady=(16, 0))
-        tk.Label(hdr, text="🧍 PostureGuard", font=FONT_HEAD,
-                 bg=BG_DARK, fg=TEXT_PRI).pack(side="left")
-        tk.Label(hdr, text="Real-Time Posture Monitoring via Webcam",
-                 font=FONT_SUB, bg=BG_DARK, fg=TEXT_SEC).pack(side="left", padx=12)
+        tk.Label(hdr, text="PostureGuard", font=("Segoe UI", 20, "bold"), bg=BG_DARK, fg=TEXT_PRI).pack(side="left")
+        tk.Label(hdr, text="Real-Time Posture Monitoring via Webcam", font=("Segoe UI", 10), bg=BG_DARK, fg=TEXT_SEC).pack(side="left", padx=12)
 
-        # Main layout
         main = tk.Frame(self, bg=BG_DARK)
         main.pack(fill="both", expand=True, padx=20, pady=12)
 
-        # Left — video
-        left = tk.Frame(main, bg=BG_CARD,
-                        highlightthickness=1, highlightbackground=BORDER)
+        left = tk.Frame(main, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
         left.pack(side="left", fill="both", expand=True)
-
-        self.video_label = tk.Label(
-            left, bg=BG_CARD,
-            text="📷  Camera feed will appear here",
-            fg=TEXT_SEC, font=FONT_SUB
-        )
+        self.video_label = tk.Label(left, bg=BG_CARD, text="Camera feed will appear here", fg=TEXT_SEC, font=("Segoe UI", 11))
         self.video_label.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # Right — panel
-        right = tk.Frame(main, bg=BG_CARD, width=290,
-                         highlightthickness=1, highlightbackground=BORDER)
+        right = tk.Frame(main, bg=BG_CARD, width=290, highlightthickness=1, highlightbackground=BORDER)
         right.pack(side="right", fill="y", padx=(12, 0))
         right.pack_propagate(False)
         self._build_panel(right)
 
-        # Status bar
-        sb = tk.Frame(self, bg=BG_CARD, height=30,
-                      highlightthickness=1, highlightbackground=BORDER)
+        sb = tk.Frame(self, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
         sb.pack(fill="x", padx=20, pady=(0, 10))
-        tk.Label(sb, textvariable=self.status_var, font=FONT_SM,
-                 bg=BG_CARD, fg=ACCENT, anchor="w").pack(side="left", padx=10, pady=5)
+        tk.Label(sb, textvariable=self.status_var, font=("Consolas", 9), bg=BG_CARD, fg=ACCENT, anchor="w").pack(side="left", padx=10, pady=5)
 
-    def _build_panel(self, parent):
-        p = {"padx": 14, "pady": 4}
+    def _build_panel(self, p):
+        pad = {"padx": 14, "pady": 4}
+        tk.Label(p, text="POSTURE STATE", font=("Segoe UI", 8, "bold"), bg=BG_CARD, fg=TEXT_SEC).pack(anchor="w", padx=14, pady=(8,2))
+        self.badge = tk.Label(p, textvariable=self.posture_var, font=("Segoe UI", 16, "bold"), bg=BG_CARD, fg=GOOD_C)
+        self.badge.pack(**pad)
+        ttk.Separator(p, orient="horizontal").pack(fill="x", padx=14, pady=6)
 
-        # ── Posture state ──
-        self._sec(parent, "POSTURE STATE")
-        self.posture_badge = tk.Label(
-            parent, textvariable=self.posture_var,
-            font=("Segoe UI", 16, "bold"), bg=BG_CARD, fg=GOOD_C
-        )
-        self.posture_badge.pack(**p)
+        tk.Label(p, text="CAMERA", font=("Segoe UI", 8, "bold"), bg=BG_CARD, fg=TEXT_SEC).pack(anchor="w", padx=14, pady=(8,2))
+        self.btn_start = tk.Button(p, text="Start Monitoring", bg=ACCENT, fg=TEXT_PRI, font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2", bd=0, pady=7, command=self._start)
+        self.btn_start.pack(fill="x", **pad)
+        self.btn_stop = tk.Button(p, text="Stop", bg="#444", fg=TEXT_PRI, font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2", bd=0, pady=7, command=self._stop, state="disabled")
+        self.btn_stop.pack(fill="x", **pad)
+        tk.Button(p, text="Reset Baseline", bg="#2a2d3e", fg=TEXT_PRI, font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2", bd=0, pady=7, command=self._reset_baseline).pack(fill="x", **pad)
+        ttk.Separator(p, orient="horizontal").pack(fill="x", padx=14, pady=6)
 
-        self._sep(parent)
-
-        # ── Camera controls ──
-        self._sec(parent, "CAMERA")
-        self.btn_start = self._btn(parent, "▶  Start Monitoring", ACCENT, self._start)
-        self.btn_start.pack(fill="x", **p)
-        self.btn_stop = self._btn(parent, "⏹  Stop", "#444", self._stop, state="disabled")
-        self.btn_stop.pack(fill="x", **p)
-        self._btn(parent, "🔄  Reset Stats", "#2a2d3e", self._reset_stats).pack(fill="x", **p)
-
-        self._sep(parent)
-
-        # ── Live metrics ──
-        self._sec(parent, "LIVE METRICS")
-        metrics_frame = tk.Frame(parent, bg=BG_CARD)
-        metrics_frame.pack(fill="x", padx=14, pady=4)
-
-        rows = [
-            ("Head Tilt",  self.tilt_var),
-            ("Ear Y Ratio", self.ear_var),
-            ("Eye Tilt",   self.eye_var),
-        ]
-        for label, var in rows:
-            row = tk.Frame(metrics_frame, bg=BG_CARD)
+        tk.Label(p, text="LIVE METRICS", font=("Segoe UI", 8, "bold"), bg=BG_CARD, fg=TEXT_SEC).pack(anchor="w", padx=14, pady=(8,2))
+        mf = tk.Frame(p, bg=BG_CARD)
+        mf.pack(fill="x", padx=14, pady=4)
+        for lbl, var in [("Face Y pos", self.y_var), ("Face size", self.size_var), ("Side offset", self.offset_var)]:
+            row = tk.Frame(mf, bg=BG_CARD)
             row.pack(fill="x", pady=2)
-            tk.Label(row, text=label, font=FONT_SM, bg=BG_CARD,
-                     fg=TEXT_SEC, width=12, anchor="w").pack(side="left")
-            tk.Label(row, textvariable=var, font=FONT_MONO,
-                     bg=BG_CARD, fg=TEXT_PRI).pack(side="left")
+            tk.Label(row, text=lbl, font=("Consolas", 9), bg=BG_CARD, fg=TEXT_SEC, width=12, anchor="w").pack(side="left")
+            tk.Label(row, textvariable=var, font=("Consolas", 10), bg=BG_CARD, fg=TEXT_PRI).pack(side="left")
+        ttk.Separator(p, orient="horizontal").pack(fill="x", padx=14, pady=6)
 
-        self._sep(parent)
-
-        # ── Session stats ──
-        self._sec(parent, "SESSION STATS")
-        stats = [
-            ("⏱  Duration",     self.session_var),
-            ("✅  Good posture", self.good_pct_var),
-            ("🔔  Alerts fired", self.alerts_var),
-        ]
-        for label, var in stats:
-            row = tk.Frame(parent, bg=BG_CARD)
+        tk.Label(p, text="SESSION STATS", font=("Segoe UI", 8, "bold"), bg=BG_CARD, fg=TEXT_SEC).pack(anchor="w", padx=14, pady=(8,2))
+        for lbl, var in [("Duration", self.session_var), ("Good posture", self.good_var), ("Alerts fired", self.alert_var)]:
+            row = tk.Frame(p, bg=BG_CARD)
             row.pack(fill="x", padx=14, pady=2)
-            tk.Label(row, text=label, font=FONT_SM, bg=BG_CARD,
-                     fg=TEXT_SEC, width=16, anchor="w").pack(side="left")
-            tk.Label(row, textvariable=var, font=FONT_MONO,
-                     bg=BG_CARD, fg=TEXT_PRI).pack(side="left")
+            tk.Label(row, text=lbl, font=("Consolas", 9), bg=BG_CARD, fg=TEXT_SEC, width=14, anchor="w").pack(side="left")
+            tk.Label(row, textvariable=var, font=("Consolas", 10), bg=BG_CARD, fg=TEXT_PRI).pack(side="left")
+        ttk.Separator(p, orient="horizontal").pack(fill="x", padx=14, pady=6)
 
-        self._sep(parent)
+        tk.Label(p, text="Sit normally -> auto-calibrates\nin 3 sec. Then slouch to test!",
+                 font=("Segoe UI", 9), bg=BG_CARD, fg=TEXT_SEC, justify="left").pack(padx=14, pady=4, anchor="w")
 
-        # ── Threshold tuning ──
-        self._sec(parent, "SENSITIVITY")
-        sens_frame = tk.Frame(parent, bg=BG_CARD)
-        sens_frame.pack(fill="x", padx=14, pady=4)
-
-        tk.Label(sens_frame, text="Head Tilt Limit (°)",
-                 font=FONT_SM, bg=BG_CARD, fg=TEXT_SEC).pack(anchor="w")
-        self.tilt_slider = tk.Scale(
-            sens_frame, from_=10, to=50, orient="horizontal",
-            bg=BG_CARD, fg=TEXT_PRI, troughcolor=BORDER,
-            highlightthickness=0, bd=0,
-            command=self._update_thresholds
-        )
-        self.tilt_slider.set(int(self.thresholds["head_tilt_bad"]))
-        self.tilt_slider.pack(fill="x")
-
-        tk.Label(sens_frame, text="Alert Cooldown (sec)",
-                 font=FONT_SM, bg=BG_CARD, fg=TEXT_SEC).pack(anchor="w", pady=(6, 0))
-        self.cooldown_slider = tk.Scale(
-            sens_frame, from_=3, to=30, orient="horizontal",
-            bg=BG_CARD, fg=TEXT_PRI, troughcolor=BORDER,
-            highlightthickness=0, bd=0,
-            command=self._update_cooldown
-        )
-        self.cooldown_slider.set(8)
-        self.cooldown_slider.pack(fill="x")
-
-    def _sec(self, parent, text):
-        tk.Label(parent, text=text, font=("Segoe UI", 8, "bold"),
-                 bg=BG_CARD, fg=TEXT_SEC).pack(anchor="w", padx=14, pady=(8, 2))
-
-    def _sep(self, parent):
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=14, pady=6)
-
-    def _btn(self, parent, text, color, cmd, state="normal"):
-        return tk.Button(
-            parent, text=text, bg=color, fg=TEXT_PRI,
-            font=("Segoe UI", 10, "bold"), relief="flat",
-            cursor="hand2", activebackground=color,
-            bd=0, pady=7, command=cmd, state=state
-        )
-
-    # ─────────────────────────────────────────────
-    # CAMERA CONTROL
-    # ─────────────────────────────────────────────
     def _start(self):
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            messagebox.showerror("Camera Error", "Could not open webcam.")
+        self.cap = None
+        for idx in [1, 0, 2]:
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self.cap = cap
+                    break
+            cap.release()
+        if not self.cap:
+            messagebox.showerror("Camera Error", "No camera found. Make sure DroidCam is open and connected.")
             return
         self.running = True
+        self.warmup = 0
+        self.baseline = None
         self.session_start = time.time()
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
-        self.alert_mgr.reset()
-        self.status_var.set("Monitoring active. Sit comfortably and face the camera.")
-        threading.Thread(target=self._video_loop, daemon=True).start()
+        self.status_var.set("Camera active. Sit normally — calibrating in 3 seconds...")
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def _stop(self):
         self.running = False
         if self.cap:
             self.cap.release()
             self.cap = None
-        self.video_label.config(image="", text="📷  Monitoring stopped.", fg=TEXT_SEC)
+        self.video_label.config(image="", text="Camera stopped.", fg=TEXT_SEC)
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.posture_var.set("—")
-        self.status_var.set("Monitoring stopped.")
+        self.status_var.set("Stopped.")
 
-    # ─────────────────────────────────────────────
-    # VIDEO LOOP
-    # ─────────────────────────────────────────────
-    def _video_loop(self):
-        alert_count = 0
-
+    def _loop(self):
         while self.running:
             ret, frame = self.cap.read()
-            if not ret:
-                break
+            if not ret or frame is None:
+                time.sleep(0.05)
+                continue
+
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
+            display = frame.copy()
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            landmarks, face_rect = get_landmarks(gray)
+            gray = cv2.equalizeHist(gray)
 
-            state   = "NO_FACE"
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+
+            state = "NO_FACE"
             metrics = {}
 
-            if landmarks is not None:
-                state, metrics = get_posture_state(
-                    landmarks, frame.shape[0], self.thresholds
-                )
-                frame = draw_landmarks_on_frame(frame, landmarks, face_rect, state)
+            if len(faces) > 0:
+                self.warmup += 1
+                fx, fy, fw, fh = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
 
-                # Update stats
+                if self.warmup == 30:
+                    self.baseline = {"y": fy + fh//2, "size": fw/w}
+                    self.after(0, lambda: self.status_var.set("Baseline set! Monitoring active. Slouch forward to test the alert."))
+
+                state, metrics, self.baseline = analyze_posture(fx, fy, fw, fh, w, h, self.baseline)
+
+                col = {"GOOD": (56,217,169), "WARNING": (0,200,255), "SLOUCH": (80,80,247)}.get(state, (200,200,200))
+                cv2.rectangle(display, (fx, fy), (fx+fw, fy+fh), col, 2)
+                cv2.rectangle(display, (fx, fy-30), (fx+fw, fy), col, -1)
+                cv2.putText(display, state, (fx+6, fy-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                cx2, cy2 = fx+fw//2, fy+fh//2
+                cv2.circle(display, (cx2, cy2), 4, col, -1)
+
                 self.total_frames += 1
                 if state == "GOOD":
                     self.good_frames += 1
-                elif state == "WARNING":
-                    self.warn_frames += 1
-                else:
-                    self.bad_frames += 1
+                    self.alert_streak = 0
+                elif state == "SLOUCH":
+                    self.alert_streak += 1
+                    if self.alert_streak >= 25 and time.time() - self.last_alert > 8:
+                        self.last_alert = time.time()
+                        self.alert_count += 1
+                        self.alert_streak = 0
+                        threading.Thread(target=lambda: winsound.Beep(880, 600), daemon=True).start()
 
-                # Alert manager
-                banner, fired = self.alert_mgr.update(state)
-                if fired:
-                    alert_count += 1
-
-                # Draw banner overlay on frame
-                if banner:
-                    text, color, _ = banner
-                    overlay = frame.copy()
-                    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 60), color, -1)
-                    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-                    cv2.putText(frame, text, (16, 42),
-                                cv2.FONT_HERSHEY_DUPLEX, 0.85, (255, 255, 255), 2)
-
+                if state == "SLOUCH" and self.alert_streak > 15:
+                    ov = display.copy()
+                    cv2.rectangle(ov, (0, 0), (w, 55), (0, 0, 180), -1)
+                    cv2.addWeighted(ov, 0.7, display, 0.3, 0, display)
+                    cv2.putText(display, "SLOUCH DETECTED - Sit Up Straight!", (12, 38), cv2.FONT_HERSHEY_DUPLEX, 0.75, (255,255,255), 2)
             else:
-                # No face — draw subtle message
-                cv2.putText(frame, "No face detected", (16, 36),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 120, 120), 1)
+                cv2.putText(display, "No face — look straight at camera", (12, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120,120,120), 1)
 
-            # Draw state indicator in corner
-            state_colors = {
-                "GOOD":    (56, 217, 169),
-                "WARNING": (0, 200, 255),
-                "SLOUCH":  (80, 80, 247),
-                "NO_FACE": (120, 120, 120),
-            }
-            sc = state_colors.get(state, (200, 200, 200))
-            cv2.circle(frame, (frame.shape[1] - 24, 24), 12, sc, -1)
+            dot = {"GOOD":(56,217,169),"WARNING":(0,200,255),"SLOUCH":(80,80,247),"NO_FACE":(80,80,80)}.get(state,(80,80,80))
+            cv2.circle(display, (w-20, 20), 10, dot, -1)
 
-            # UI updates via main thread
-            pct = (self.good_frames / max(self.total_frames, 1)) * 100
-            self.after(0, self._update_ui, state, metrics, pct, alert_count)
+            pct = self.good_frames / max(self.total_frames, 1) * 100
+            self.after(0, self._update_ui, state, metrics, pct)
 
-            # Convert frame for Tkinter
-            rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb  = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
             img  = Image.fromarray(rgb)
-            w    = self.video_label.winfo_width()  or 720
-            h    = self.video_label.winfo_height() or 500
-            img  = img.resize((w, h), Image.LANCZOS)
+            lw   = self.video_label.winfo_width() or 720
+            lh   = self.video_label.winfo_height() or 500
+            img  = img.resize((lw, lh), Image.LANCZOS)
             imgt = ImageTk.PhotoImage(image=img)
             self.after(0, self._set_frame, imgt)
-
-            time.sleep(0.033)  # ~30 FPS
+            time.sleep(0.033)
 
     def _set_frame(self, imgt):
         self.video_label.imgtk = imgt
         self.video_label.config(image=imgt, text="")
 
-    def _update_ui(self, state, metrics, good_pct, alert_count):
-        colors = {
-            "GOOD":    GOOD_C,
-            "WARNING": WARN_C,
-            "SLOUCH":  BAD_C,
-            "NO_FACE": TEXT_SEC,
-        }
-        labels = {
-            "GOOD":    "✅  GOOD",
-            "WARNING": "⚠️  WARNING",
-            "SLOUCH":  "❌  SLOUCH",
-            "NO_FACE": "👤  No Face",
-        }
-        self.posture_var.set(labels.get(state, state))
-        self.posture_badge.config(fg=colors.get(state, TEXT_SEC))
-
+    def _update_ui(self, state, metrics, pct):
+        cols  = {"GOOD": GOOD_C, "WARNING": WARN_C, "SLOUCH": BAD_C, "NO_FACE": TEXT_SEC}
+        labls = {"GOOD": "GOOD", "WARNING": "WARNING", "SLOUCH": "SLOUCH", "NO_FACE": "No Face"}
+        self.posture_var.set(labls.get(state, state))
+        self.badge.config(fg=cols.get(state, TEXT_SEC))
         if metrics:
-            self.tilt_var.set(f"{metrics.get('head_tilt_deg', '—')}°")
-            self.ear_var.set(f"{metrics.get('ear_y_ratio', '—')}")
-            self.eye_var.set(f"{metrics.get('eye_tilt_deg', '—')}°")
+            self.y_var.set(f"{metrics.get('face_y_pct','—')}%")
+            self.size_var.set(f"{metrics.get('face_size_pct','—')}%")
+            self.offset_var.set(f"{metrics.get('center_offset','—')}%")
+        self.good_var.set(f"{pct:.1f}%")
+        self.alert_var.set(str(self.alert_count))
+        msgs = {"GOOD": "Great posture! Keep it up.", "WARNING": "Posture slightly off.", "SLOUCH": "Slouching! Sit straight.", "NO_FACE": "Look straight at the camera."}
+        self.status_var.set(msgs.get(state, ""))
 
-        self.good_pct_var.set(f"{good_pct:.1f}%")
-        self.alerts_var.set(str(alert_count))
+    def _reset_baseline(self):
+        self.baseline = None
+        self.warmup = 0
+        self.status_var.set("Baseline reset. Sit normally to re-calibrate...")
 
-        if state == "SLOUCH":
-            self.status_var.set("⚠ Poor posture detected! Straighten your back and lift your head.")
-        elif state == "WARNING":
-            self.status_var.set("⚡ Posture slightly off — adjust your sitting position.")
-        elif state == "GOOD":
-            self.status_var.set("✅ Great posture! Keep it up.")
-        elif state == "NO_FACE":
-            self.status_var.set("👤 Face not visible — position yourself in front of the camera.")
-
-    # ─────────────────────────────────────────────
-    # CLOCK & STATS
-    # ─────────────────────────────────────────────
-    def _tick_clock(self):
+    def _tick(self):
         if self.session_start and self.running:
-            elapsed = int(time.time() - self.session_start)
-            m, s = divmod(elapsed, 60)
-            self.session_var.set(f"{m:02d}:{s:02d}")
-        self.after(1000, self._tick_clock)
+            e = int(time.time() - self.session_start)
+            self.session_var.set(f"{e//60:02d}:{e%60:02d}")
+        self.after(1000, self._tick)
 
-    def _reset_stats(self):
-        self.total_frames = self.good_frames = self.warn_frames = self.bad_frames = 0
-        self.session_start = time.time() if self.running else None
-        self.alert_mgr.reset()
-        self.good_pct_var.set("—")
-        self.alerts_var.set("0")
-        self.session_var.set("00:00")
-
-    # ─────────────────────────────────────────────
-    # SETTINGS
-    # ─────────────────────────────────────────────
-    def _update_thresholds(self, val):
-        v = float(val)
-        self.thresholds["head_tilt_bad"]  = v
-        self.thresholds["head_tilt_warn"] = max(10, v - 10)
-
-    def _update_cooldown(self, val):
-        self.alert_mgr.cooldown = int(val)
-
-    # ─────────────────────────────────────────────
-    # CLEANUP
-    # ─────────────────────────────────────────────
     def _on_close(self):
         self.running = False
         if self.cap:
