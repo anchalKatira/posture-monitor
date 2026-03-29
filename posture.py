@@ -1,67 +1,70 @@
-import dlib
 import cv2
 import numpy as np
 import os
+import dlib
 
-# ── dlib setup ──
-detector = dlib.get_frontal_face_detector()
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Path to shape predictor model (will be downloaded if not present)
 PREDICTOR_PATH = "shape_predictor_68_face_landmarks.dat"
 predictor = None
 
 
 def load_predictor():
-    """Load dlib's 68-point landmark predictor."""
     global predictor
     if not os.path.exists(PREDICTOR_PATH):
         raise FileNotFoundError(
             f"Missing: {PREDICTOR_PATH}\n"
-            "Download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2\n"
-            "Extract and place in the project folder."
+            "Download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
         )
     predictor = dlib.shape_predictor(PREDICTOR_PATH)
 
 
 def get_landmarks(gray_frame):
-    """
-    Detect face and return 68 facial landmarks.
-    Returns (landmarks_array, face_rect) or (None, None) if no face found.
-    landmarks_array shape: (68, 2) — (x, y) per point
-    """
-    faces = detector(gray_frame, 0)
+    if gray_frame is None:
+        return None, None
+    if not isinstance(gray_frame, np.ndarray):
+        return None, None
+    if gray_frame.size == 0:
+        return None, None
+    if len(gray_frame.shape) != 2:
+        return None, None
+    if gray_frame.dtype != np.uint8:
+        gray_frame = gray_frame.astype(np.uint8)
+
+    # KEY FIX: histogram equalization for dark faces
+    gray_frame = cv2.equalizeHist(gray_frame)
+
+    faces = face_cascade.detectMultiScale(
+        gray_frame,
+        scaleFactor=1.05,
+        minNeighbors=3,
+        minSize=(30, 30)
+    )
+
     if len(faces) == 0:
         return None, None
 
-    face = faces[0]  # use first detected face
-    shape = predictor(gray_frame, face)
-    landmarks = np.array([[shape.part(i).x, shape.part(i).y] for i in range(68)])
-    return landmarks, face
+    x, y, w, h = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
+    dlib_rect = dlib.rectangle(int(x), int(y), int(x + w), int(y + h))
+
+    try:
+        shape = predictor(gray_frame, dlib_rect)
+        landmarks = np.array([[shape.part(i).x, shape.part(i).y] for i in range(68)])
+        return landmarks, dlib_rect
+    except Exception:
+        return None, None
 
 
 def calculate_angle(p1, p2):
-    """
-    Calculate the angle (in degrees) of the line from p1 to p2
-    relative to the horizontal axis.
-    """
     dx = p2[0] - p1[0]
     dy = p2[1] - p1[1]
-    angle = np.degrees(np.arctan2(dy, dx))
-    return angle
+    return np.degrees(np.arctan2(dy, dx))
 
 
 def calculate_head_tilt(landmarks):
-    """
-    Estimate vertical head tilt using:
-    - Nose tip (point 30)
-    - Chin (point 8)
-    A well-aligned head will have a near-vertical nose-to-chin line.
-    Returns the angle deviation from vertical (0 = perfect upright).
-    """
     nose_tip = landmarks[30]
     chin     = landmarks[8]
-    angle = calculate_angle(nose_tip, chin)
-    # Vertical is -90 degrees; deviation from that
+    angle    = calculate_angle(nose_tip, chin)
     deviation = abs(angle - (-90))
     if deviation > 180:
         deviation = 360 - deviation
@@ -69,16 +72,6 @@ def calculate_head_tilt(landmarks):
 
 
 def calculate_ear_shoulder_ratio(landmarks, frame_height):
-    """
-    Estimate forward head posture by comparing:
-    - Ear position (avg of left ear point 0 and right ear point 16)
-    - Eye level (avg of left eye corner 36 and right eye corner 45)
-
-    When the head leans forward/down, ears drop relative to the frame height.
-    We use the y-position of ears relative to frame height as a proxy.
-
-    Returns a normalized ear_y ratio (higher = head lower / more forward).
-    """
     left_ear  = landmarks[0]
     right_ear = landmarks[16]
     ear_y     = (left_ear[1] + right_ear[1]) / 2
@@ -86,12 +79,6 @@ def calculate_ear_shoulder_ratio(landmarks, frame_height):
 
 
 def calculate_eye_level_tilt(landmarks):
-    """
-    Detect lateral head tilt by measuring the slope of the eye line.
-    - Left eye outer corner: point 36
-    - Right eye outer corner: point 45
-    Returns the absolute angle of the eye line from horizontal.
-    """
     left_eye  = landmarks[36]
     right_eye = landmarks[45]
     angle = abs(calculate_angle(left_eye, right_eye))
@@ -101,16 +88,9 @@ def calculate_eye_level_tilt(landmarks):
 
 
 def get_posture_state(landmarks, frame_height, thresholds):
-    """
-    Combine multiple metrics to determine posture state.
-
-    Returns:
-        state (str): "GOOD", "WARNING", or "SLOUCH"
-        metrics (dict): individual metric values for display
-    """
-    head_tilt     = calculate_head_tilt(landmarks)
-    ear_ratio     = calculate_ear_shoulder_ratio(landmarks, frame_height)
-    eye_tilt      = calculate_eye_level_tilt(landmarks)
+    head_tilt = calculate_head_tilt(landmarks)
+    ear_ratio = calculate_ear_shoulder_ratio(landmarks, frame_height)
+    eye_tilt  = calculate_eye_level_tilt(landmarks)
 
     metrics = {
         "head_tilt_deg": round(head_tilt, 1),
@@ -118,7 +98,6 @@ def get_posture_state(landmarks, frame_height, thresholds):
         "eye_tilt_deg":  round(eye_tilt, 1),
     }
 
-    # Determine state
     slouch_score = 0
     if head_tilt > thresholds["head_tilt_warn"]:
         slouch_score += 1
@@ -142,35 +121,28 @@ def get_posture_state(landmarks, frame_height, thresholds):
 
 
 def draw_landmarks_on_frame(frame, landmarks, face_rect, state):
-    """
-    Annotate the frame with:
-    - Bounding box around face (color-coded by state)
-    - Key landmark points (eyes, nose, chin, ears)
-    - State label
-    """
     colors = {
-        "GOOD":    (56, 217, 169),   # teal-green
-        "WARNING": (0, 200, 255),    # orange-yellow
-        "SLOUCH":  (80, 80, 247),    # red
+        "GOOD":    (56, 217, 169),
+        "WARNING": (0, 200, 255),
+        "SLOUCH":  (80, 80, 247),
     }
     color = colors.get(state, (200, 200, 200))
 
-    # Face bounding box
-    x1, y1, x2, y2 = face_rect.left(), face_rect.top(), face_rect.right(), face_rect.bottom()
+    x1 = face_rect.left()
+    y1 = face_rect.top()
+    x2 = face_rect.right()
+    y2 = face_rect.bottom()
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    # Key landmark dots
-    key_points = [0, 8, 16, 30, 36, 45]   # ears, chin, nose, eye corners
+    key_points = [0, 8, 16, 30, 36, 45]
     for idx in key_points:
         pt = tuple(landmarks[idx].astype(int))
         cv2.circle(frame, pt, 4, color, -1)
 
-    # Draw nose-to-chin line
     nose = tuple(landmarks[30].astype(int))
     chin = tuple(landmarks[8].astype(int))
     cv2.line(frame, nose, chin, color, 2)
 
-    # Draw eye line
     leye = tuple(landmarks[36].astype(int))
     reye = tuple(landmarks[45].astype(int))
     cv2.line(frame, leye, reye, color, 1)
@@ -178,11 +150,10 @@ def draw_landmarks_on_frame(frame, landmarks, face_rect, state):
     return frame
 
 
-# ── Default thresholds (tunable from GUI) ──
 DEFAULT_THRESHOLDS = {
-    "head_tilt_warn":  18.0,   # degrees deviation from vertical
+    "head_tilt_warn":  18.0,
     "head_tilt_bad":   30.0,
-    "ear_ratio_warn":  0.42,   # ear y / frame height
+    "ear_ratio_warn":  0.42,
     "ear_ratio_bad":   0.50,
-    "eye_tilt_warn":   8.0,    # degrees from horizontal
+    "eye_tilt_warn":   8.0,
 }
